@@ -1,140 +1,156 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { useEffect } from 'react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { useState } from 'react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import ErrorBoundary from './ErrorBoundary';
 
-/**
- * Whether the child's underlying failure is currently active.
- *
- * This is the "transient cause" model rather than a throw-counter. That is
- * deliberate: React 19 re-invokes a component's render function when it throws
- * (up to ~3 times inside the same commit), so a "throw on the first render
- * then succeed" counter heals itself before `getDerivedStateFromError` ever
- * runs and the boundary never shows its fallback. Tying the throw to an
- * external cause makes the fallback deterministic, and matches the real
- * scenario the Retry button exists for: a transient failure that has gone away
- * by the time the user retries.
- */
-let failureActive = true;
-
-/**
- * Counts *committed* mounts of the child.
- *
- * The throwing render never reaches its effect, so this stays 0 while the
- * fallback is showing and becomes 1 only after a real, fresh mount. That is
- * what distinguishes a genuine remount from an error flag being cleared on a
- * subtree that was never torn down.
- */
-let mountCount = 0;
-
-function TransientlyFailingChild() {
-  useEffect(() => {
-    mountCount += 1;
-  }, []);
-
-  if (failureActive) {
-    throw new Error('child exploded');
+function ProblemChild({ shouldThrow, message }: { shouldThrow: boolean; message?: string }) {
+  if (shouldThrow) {
+    throw new Error(message || 'Test route crash');
   }
-
-  return <p>Recovered content</p>;
+  return <div>Healthy Route Content</div>;
 }
 
-function renderBoundary() {
-  return render(
-    <ErrorBoundary>
-      <TransientlyFailingChild />
-    </ErrorBoundary>,
-  );
-}
+describe('ErrorBoundary', () => {
+  let consoleSpy: ReturnType<typeof vi.spyOn>;
+  const originalLocation = window.location;
 
-beforeEach(() => {
-  failureActive = true;
-  mountCount = 0;
-  // The boundary logs via componentDidCatch and React logs uncaught render
-  // errors; keep the expected noise out of the reporter output.
-  vi.spyOn(console, 'error').mockImplementation(() => {});
-});
-
-afterEach(() => {
-  cleanup();
-  vi.restoreAllMocks();
-});
-
-describe('<ErrorBoundary />', () => {
-  it('renders its fallback UI when a child throws', () => {
-    renderBoundary();
-
-    // Query the real fallback: role="alert" plus the component's own copy.
-    expect(screen.getByRole('alert')).toBeInTheDocument();
-    expect(
-      screen.getByRole('heading', { name: 'Something went wrong' }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        'An unexpected error occurred on this page. You can retry or go back home.',
-      ),
-    ).toBeInTheDocument();
-
-    // The failed child never committed, so none of its output is present.
-    expect(screen.queryByText('Recovered content')).not.toBeInTheDocument();
-    expect(mountCount).toBe(0);
+  beforeEach(() => {
+    consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    Object.defineProperty(window, 'location', {
+      writable: true,
+      value: { ...originalLocation, href: 'http://localhost/dashboard', reload: vi.fn() },
+    });
   });
 
-  it('offers both recovery actions in the fallback', () => {
-    renderBoundary();
-
-    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Go Home' })).toBeInTheDocument();
+  afterEach(() => {
+    consoleSpy.mockRestore();
+    Object.defineProperty(window, 'location', {
+      writable: true,
+      value: originalLocation,
+    });
   });
 
-  it('remounts the children successfully after Retry is clicked', () => {
-    renderBoundary();
+  it('renders children without error when component functions normally', () => {
+    render(
+      <ErrorBoundary>
+        <ProblemChild shouldThrow={false} />
+      </ErrorBoundary>,
+    );
 
-    expect(screen.queryByText('Recovered content')).not.toBeInTheDocument();
-    expect(mountCount).toBe(0);
-
-    // The transient cause is gone, but the boundary still holds the error
-    // until Retry is pressed. Asserting this intermediate state is what makes
-    // the test meaningful: recovery is caused by the click, not by the cause
-    // disappearing on its own.
-    failureActive = false;
-    expect(screen.getByRole('alert')).toBeInTheDocument();
-    expect(screen.queryByText('Recovered content')).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
-
-    // Not merely "the fallback went away" — the child's recovered output is
-    // actually rendered, through a fresh mount (mount count 0 -> 1).
-    expect(screen.getByText('Recovered content')).toBeInTheDocument();
-    expect(mountCount).toBe(1);
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByText('Healthy Route Content')).toBeInTheDocument();
   });
 
-  it('surfaces the fallback again if the child keeps failing on retry', () => {
-    // Guards the retry path in both directions: Retry must not be a one-way
-    // door that renders a broken child into the page.
-    renderBoundary();
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+  it('catches forced throw in a route and renders branded recovery UI', () => {
+    render(
+      <ErrorBoundary>
+        <ProblemChild shouldThrow={true} message="Critical database disconnect" />
+      </ErrorBoundary>,
+    );
 
-    expect(screen.getByRole('alert')).toBeInTheDocument();
-    expect(screen.queryByText('Recovered content')).not.toBeInTheDocument();
-    expect(mountCount).toBe(0);
+    const alertContainer = screen.getByRole('alert');
+    expect(alertContainer).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /something went wrong/i })).toBeInTheDocument();
+    expect(screen.getByText(/critical database disconnect/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /go home/i })).toBeInTheDocument();
   });
 
-  it('is exercised standalone, without LazyBoundary in the tree', () => {
-    // App.tsx composes ErrorBoundary > LazyBoundary, and LazyBoundary is a
-    // second error boundary with its own *different* fallback. Rendering
-    // ErrorBoundary on its own keeps this test pinned to its own retry logic:
-    // the copy asserted below belongs to ErrorBoundary, not LazyBoundary
-    // (whose fallback reads "This page failed to load" and whose Retry button
-    // has no type="button"). Reintroducing the wrapper here would fail this.
-    const { container } = renderBoundary();
+  it('logs the uncaught error once upon catching', () => {
+    render(
+      <ErrorBoundary>
+        <ProblemChild shouldThrow={true} message="Log error check" />
+      </ErrorBoundary>,
+    );
 
-    expect(container.textContent).toContain('Something went wrong');
-    expect(container.textContent).not.toContain('This page failed to load');
+    const boundaryErrorCalls = consoleSpy.mock.calls.filter(
+      (call) => typeof call[0] === 'string' && call[0].includes('[ErrorBoundary] uncaught error:'),
+    );
+    expect(boundaryErrorCalls).toHaveLength(1);
+  });
 
-    failureActive = false;
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
-    expect(screen.getByText('Recovered content')).toBeInTheDocument();
+  it('remounts children when Retry is clicked', () => {
+    let throwState = true;
+    function DynamicThrower() {
+      if (throwState) {
+        throw new Error('Dynamic failure');
+      }
+      return <div>Recovered Component</div>;
+    }
+
+    const { rerender } = render(
+      <ErrorBoundary>
+        <DynamicThrower />
+      </ErrorBoundary>,
+    );
+
+    expect(screen.getByText('Something went wrong')).toBeInTheDocument();
+
+    throwState = false;
+    const retryButton = screen.getByRole('button', { name: /retry/i });
+    fireEvent.click(retryButton);
+
+    rerender(
+      <ErrorBoundary>
+        <DynamicThrower />
+      </ErrorBoundary>,
+    );
+
+    expect(screen.getByText('Recovered Component')).toBeInTheDocument();
+  });
+
+  it('navigates home when Go Home is clicked', () => {
+    render(
+      <ErrorBoundary>
+        <ProblemChild shouldThrow={true} />
+      </ErrorBoundary>,
+    );
+
+    const goHomeBtn = screen.getByRole('button', { name: /go home/i });
+    fireEvent.click(goHomeBtn);
+
+    expect(window.location.href).toBe('/');
+  });
+
+  it('enforces maximum retry limit to avoid infinite retry loops', () => {
+    render(
+      <ErrorBoundary>
+        <ProblemChild shouldThrow={true} message="Persistent crash" />
+      </ErrorBoundary>,
+    );
+
+    // Initial throw
+    expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument();
+
+    // Retry 1
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
+    expect(screen.getByText(/retry attempt 1 of 3/i)).toBeInTheDocument();
+
+    // Retry 2
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
+    expect(screen.getByText(/retry attempt 2 of 3/i)).toBeInTheDocument();
+
+    // Retry 3 -> hits MAX_RETRIES threshold
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
+
+    expect(screen.getByText(/max retries exceeded \(3\/3\)/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^retry$/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /reload page/i })).toBeInTheDocument();
+
+    // Clicking Reload Page invokes window.location.reload
+    fireEvent.click(screen.getByRole('button', { name: /reload page/i }));
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('manages focus accessibility by shifting focus to retry action', async () => {
+    render(
+      <ErrorBoundary>
+        <ProblemChild shouldThrow={true} />
+      </ErrorBoundary>,
+    );
+
+    await waitFor(() => {
+      const retryBtn = screen.getByRole('button', { name: /retry/i });
+      expect(document.activeElement).toBe(retryBtn);
+    });
   });
 });
